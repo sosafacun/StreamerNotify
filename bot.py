@@ -1,97 +1,116 @@
-# Created with ChatGPT
-
-import requests, hmac, hashlib
+import os
+import hmac
+import hashlib
+import json
+import aiohttp
 from fastapi import FastAPI, Request
 import uvicorn
 
-# Twitch app credentials (make a Twitch dev app)
-CLIENT_ID = "your_twitch_client_id"
-CLIENT_SECRET = "your_twitch_client_secret"
+# Twitch API credentials
+CLIENT_ID = "your_client_id"
+APP_TOKEN = "your_app_access_token"  # Use a valid App Access Token
+SECRET = b"supersecret"  # Must match what you use in Twitch webhook setup
+CALLBACK_URL = "https://twitch.domain.me/twitch/callback"
 
-# Discord webhook URL (channel you want to notify)
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/.../... "
-
-# Secret used to validate Twitch signatures
-SECRET = b"supersecret"
-
-CALLBACK_URL = "https://yourdomain.com/twitch/callback"
+# Discord Webhook
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/your_webhook_id/your_token"
 
 app = FastAPI()
 
-# --- Twitch setup ---
-def get_app_token():
-    r = requests.post("https://id.twitch.tv/oauth2/token", params={
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "client_credentials"
-    })
-    return r.json()["access_token"]
+# -------------------------------------------------------------------
+# Read user IDs from text file
+# -------------------------------------------------------------------
+def read_user_ids(filename="streamers.txt"):
+    ids = []
+    with open(filename, "r") as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.isdigit():
+                ids.append(stripped)
+    return ids
 
-ACCESS_TOKEN = get_app_token()
 
-def get_user_id(login):
-    r = requests.get("https://api.twitch.tv/helix/users",
-                     headers={"Client-ID": CLIENT_ID,
-                              "Authorization": f"Bearer {ACCESS_TOKEN}"},
-                     params={"login": login})
-    data = r.json()["data"]
-    return data[0]["id"], data[0]["display_name"]
-
-def subscribe(user_id):
-    body = {
+# -------------------------------------------------------------------
+# Subscribe each user ID to Twitch EventSub "stream.online"
+# -------------------------------------------------------------------
+async def subscribe_to_user(session, user_id):
+    url = "https://api.twitch.tv/helix/eventsub/subscriptions"
+    headers = {
+        "Client-ID": CLIENT_ID,
+        "Authorization": f"Bearer {APP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
         "type": "stream.online",
         "version": "1",
         "condition": {"broadcaster_user_id": user_id},
         "transport": {
             "method": "webhook",
             "callback": CALLBACK_URL,
-            "secret": SECRET.decode()
-        }
+            "secret": SECRET.decode(),
+        },
     }
-    requests.post("https://api.twitch.tv/helix/eventsub/subscriptions",
-                  headers={"Client-ID": CLIENT_ID,
-                           "Authorization": f"Bearer {ACCESS_TOKEN}",
-                           "Content-Type": "application/json"},
-                  json=body)
 
-# --- Signature verification ---
-def verify_signature(request: Request, body: bytes):
-    msg_id = request.headers["Twitch-Eventsub-Message-Id"]
-    timestamp = request.headers["Twitch-Eventsub-Message-Timestamp"]
-    signature = request.headers["Twitch-Eventsub-Message-Signature"]
-    msg = msg_id + timestamp + body.decode()
-    h = "sha256=" + hmac.new(SECRET, msg.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(h, signature)
+    async with session.post(url, headers=headers, json=payload) as resp:
+        text = await resp.text()
+        print(f"Subscribed to {user_id}:", resp.status, text)
 
-# --- FastAPI route ---
+
+# -------------------------------------------------------------------
+# Verify Twitch signature
+# -------------------------------------------------------------------
+def verify_twitch_signature(request: Request, body: bytes):
+    msg_id = request.headers.get("Twitch-Eventsub-Message-Id", "")
+    timestamp = request.headers.get("Twitch-Eventsub-Message-Timestamp", "")
+    msg_signature = request.headers.get("Twitch-Eventsub-Message-Signature", "")
+
+    hmac_message = msg_id.encode() + timestamp.encode() + body
+    expected = "sha256=" + hmac.new(SECRET, hmac_message, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, msg_signature)
+
+
+# -------------------------------------------------------------------
+# Twitch callback handler
+# -------------------------------------------------------------------
 @app.post("/twitch/callback")
 async def twitch_callback(request: Request):
     body = await request.body()
-    data = await request.json()
 
-    if not verify_signature(request, body):
-        return {"status": "unauthorized"}
+    if not verify_twitch_signature(request, body):
+        return {"error": "invalid signature"}
 
-    msg_type = request.headers["Twitch-Eventsub-Message-Type"]
+    data = json.loads(body)
+    msg_type = request.headers.get("Twitch-Eventsub-Message-Type")
 
+    # Verification challenge
     if msg_type == "webhook_callback_verification":
+        print("Twitch verification request received")
         return data["challenge"]
 
-    if data["subscription"]["type"] == "stream.online":
-        user = data["event"]["broadcaster_user_name"]
-        url = f"https://twitch.tv/{user}"
-        requests.post(DISCORD_WEBHOOK, json={"content": f"{user} is live! {url}"})
-        print(f"{user} is live!")
+    # Stream Online event
+    if msg_type == "notification" and data["subscription"]["type"] == "stream.online":
+        event = data["event"]
+        broadcaster = event["broadcaster_user_login"]
+
+        async with aiohttp.ClientSession() as session:
+            await session.post(DISCORD_WEBHOOK_URL, json={
+                "content": f"🔴 {broadcaster} is now LIVE on Twitch! https://twitch.tv/{broadcaster}"
+            })
+        print(f"Sent Discord message for {broadcaster}")
 
     return {"ok": True}
 
-# --- Entry ---
+
+# -------------------------------------------------------------------
+# Startup — subscribe to all IDs in the file
+# -------------------------------------------------------------------
+@app.on_event("startup")
+async def startup_event():
+    user_ids = read_user_ids()
+    async with aiohttp.ClientSession() as session:
+        for user_id in user_ids:
+            await subscribe_to_user(session, user_id)
+
+
 if __name__ == "__main__":
-    with open("twitch_users.txt") as f:
-        for login in f:
-            login = login.strip()
-            if not login: continue
-            uid, display = get_user_id(login)
-            subscribe(uid)
-            print(f"Subscribed to {display}")
     uvicorn.run(app, host="0.0.0.0", port=8000)
