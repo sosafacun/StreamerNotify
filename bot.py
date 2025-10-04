@@ -1,42 +1,43 @@
-import os
-import requests
-import hmac
-import hashlib
+# Created with ChatGPT
+
+import requests, hmac, hashlib
 from fastapi import FastAPI, Request
 import uvicorn
 
-# --- REQUIRED ENVIRONMENT VARIABLES (set these before running) ---
-# TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, DISCORD_WEBHOOK, CALLBACK_URL
-# Optional: SECRET (default: "supersecret")
-CLIENT_ID = os.environ["TWITCH_CLIENT_ID"]
-CLIENT_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
-DISCORD_WEBHOOK = os.environ["DISCORD_WEBHOOK"]
-CALLBACK_URL = os.environ["CALLBACK_URL"]
-SECRET = os.environ.get("SECRET", "supersecret").encode()
+# Twitch app credentials (make a Twitch dev app)
+CLIENT_ID = "your_twitch_client_id"
+CLIENT_SECRET = "your_twitch_client_secret"
+
+# Discord webhook URL (channel you want to notify)
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/.../... "
+
+# Secret used to validate Twitch signatures
+SECRET = b"supersecret"
+
+CALLBACK_URL = "https://yourdomain.com/twitch/callback"
 
 app = FastAPI()
 
+# --- Twitch setup ---
 def get_app_token():
     r = requests.post("https://id.twitch.tv/oauth2/token", params={
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "grant_type": "client_credentials"
     })
-    r.raise_for_status()
     return r.json()["access_token"]
 
 ACCESS_TOKEN = get_app_token()
-HEADERS = {"Client-ID": CLIENT_ID, "Authorization": f"Bearer {ACCESS_TOKEN}"}
 
 def get_user_id(login):
-    r = requests.get("https://api.twitch.tv/helix/users", headers=HEADERS, params={"login": login})
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    if not data:
-        raise ValueError(f"user not found: {login}")
-    return data[0]["id"], data[0].get("display_name", login), data[0].get("login", login)
+    r = requests.get("https://api.twitch.tv/helix/users",
+                     headers={"Client-ID": CLIENT_ID,
+                              "Authorization": f"Bearer {ACCESS_TOKEN}"},
+                     params={"login": login})
+    data = r.json()["data"]
+    return data[0]["id"], data[0]["display_name"]
 
-def subscribe_stream_online(user_id):
+def subscribe(user_id):
     body = {
         "type": "stream.online",
         "version": "1",
@@ -47,92 +48,50 @@ def subscribe_stream_online(user_id):
             "secret": SECRET.decode()
         }
     }
-    r = requests.post("https://api.twitch.tv/helix/eventsub/subscriptions",
-                      headers={**HEADERS, "Content-Type": "application/json"},
-                      json=body)
-    # don't fail hard here; print result for debugging
-    try:
-        print("subscribe response:", r.status_code, r.json())
-    except Exception:
-        print("subscribe status:", r.status_code)
+    requests.post("https://api.twitch.tv/helix/eventsub/subscriptions",
+                  headers={"Client-ID": CLIENT_ID,
+                           "Authorization": f"Bearer {ACCESS_TOKEN}",
+                           "Content-Type": "application/json"},
+                  json=body)
 
-def fetch_stream_info(user_id):
-    r = requests.get("https://api.twitch.tv/helix/streams", headers=HEADERS, params={"user_id": user_id})
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    if not data:
-        return None
-    s = data[0]
-    title = s.get("title")
-    game_id = s.get("game_id")
-    game_name = None
-    if game_id:
-        gr = requests.get("https://api.twitch.tv/helix/games", headers=HEADERS, params={"id": game_id})
-        gr.raise_for_status()
-        gdata = gr.json().get("data", [])
-        if gdata:
-            game_name = gdata[0].get("name")
-    return {"title": title, "game": game_name}
-
+# --- Signature verification ---
 def verify_signature(request: Request, body: bytes):
-    try:
-        msg_id = request.headers["Twitch-Eventsub-Message-Id"]
-        timestamp = request.headers["Twitch-Eventsub-Message-Timestamp"]
-        signature = request.headers["Twitch-Eventsub-Message-Signature"]
-    except KeyError:
-        return False
-    hmac_message = (msg_id + timestamp).encode() + body
-    computed = "sha256=" + hmac.new(SECRET, hmac_message, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(computed, signature)
+    msg_id = request.headers["Twitch-Eventsub-Message-Id"]
+    timestamp = request.headers["Twitch-Eventsub-Message-Timestamp"]
+    signature = request.headers["Twitch-Eventsub-Message-Signature"]
+    msg = msg_id + timestamp + body.decode()
+    h = "sha256=" + hmac.new(SECRET, msg.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(h, signature)
 
+# --- FastAPI route ---
 @app.post("/twitch/callback")
 async def twitch_callback(request: Request):
     body = await request.body()
-    # Accept only verified Twitch signatures (protects endpoint)
+    data = await request.json()
+
     if not verify_signature(request, body):
         return {"status": "unauthorized"}
 
-    data = await request.json()
-    msg_type = request.headers.get("Twitch-Eventsub-Message-Type", "")
+    msg_type = request.headers["Twitch-Eventsub-Message-Type"]
 
-    # Respond to verification challenge
     if msg_type == "webhook_callback_verification":
-        return data.get("challenge", "")
+        return data["challenge"]
 
-    # Normal notifications
-    sub_type = data.get("subscription", {}).get("type", "")
-    if sub_type == "stream.online":
-        ev = data.get("event", {})
-        broadcaster_id = ev.get("broadcaster_user_id")
-        broadcaster_name = ev.get("broadcaster_user_name") or ev.get("broadcaster_user_login")
-        # enrich with title/game using Helix
-        info = fetch_stream_info(broadcaster_id) or {}
-        title = info.get("title") or "No title"
-        game = info.get("game") or ""
-        url = f"https://twitch.tv/{ev.get('broadcaster_user_login') or broadcaster_name}"
-        # Minimal Discord notification
-        content = f"🔴 {broadcaster_name} is live!\n{title}{(' — ' + game) if game else ''}\n{url}"
-        # send to Discord webhook
-        requests.post(DISCORD_WEBHOOK, json={"content": content})
-        print(content)
+    if data["subscription"]["type"] == "stream.online":
+        user = data["event"]["broadcaster_user_name"]
+        url = f"https://twitch.tv/{user}"
+        requests.post(DISCORD_WEBHOOK, json={"content": f"{user} is live! {url}"})
+        print(f"{user} is live!")
 
-    return {"status": "ok"}
+    return {"ok": True}
 
+# --- Entry ---
 if __name__ == "__main__":
-    # subscribe to each user listed in twitch_users.txt
-    try:
-        with open("twitch_users.txt", "r", encoding="utf-8") as f:
-            for raw in f:
-                login = raw.strip()
-                if not login:
-                    continue
-                try:
-                    uid, display, login_clean = get_user_id(login)
-                    subscribe_stream_online(uid)
-                    print(f"Subscribed to {display} ({login_clean}) -> {uid}")
-                except Exception as e:
-                    print(f"Skipping {login}: {e}")
-    except FileNotFoundError:
-        print("twitch_users.txt not found. Create it with one twitch username per line.")
-
+    with open("twitch_users.txt") as f:
+        for login in f:
+            login = login.strip()
+            if not login: continue
+            uid, display = get_user_id(login)
+            subscribe(uid)
+            print(f"Subscribed to {display}")
     uvicorn.run(app, host="0.0.0.0", port=8000)
